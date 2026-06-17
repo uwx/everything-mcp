@@ -220,6 +220,16 @@ export function Everything3_SetSearchHideResultOmissions(searchState: SearchStat
   ffiCall('Everything3_SetSearchHideResultOmissions', DataType.I32, [DataType.External, DataType.I32], [searchState, hideResultOmissions ? 1 : 0]);
 }
 
+// ─── Property Requests (required before GetResult* property getters work) ──────
+
+export function Everything3_AddSearchPropertyRequest(searchState: SearchStatePtr, propertyId: number): void {
+  ffiCall('Everything3_AddSearchPropertyRequest', DataType.I32, [DataType.External, DataType.U32], [searchState, propertyId]);
+}
+
+export function Everything3_ClearSearchPropertyRequests(searchState: SearchStatePtr): void {
+  ffiCall('Everything3_ClearSearchPropertyRequests', DataType.I32, [DataType.External], [searchState]);
+}
+
 // ─── Execute Search ────────────────────────────────────────────────────────────
 
 export function Everything3_Search(client: ClientPtr, searchState: SearchStatePtr): ResultListPtr {
@@ -394,12 +404,14 @@ export function checkError(): void {
 /**
  * Convert a Windows FILETIME (UINT64, 100-nanosecond intervals since 1601-01-01 UTC)
  * to a JavaScript Date, or null if the value is 0 or UINT64_MAX.
+ * Accepts both bigint and number (ffi-rs may return either for U64 types).
  */
-export function filetimeToDate(ft: bigint): Date | null {
-  if (ft === 0n || ft === 0xFFFFFFFFFFFFFFFFn) return null;
+export function filetimeToDate(ft: bigint | number): Date | null {
+  const val = typeof ft === 'bigint' ? ft : BigInt(ft);
+  if (val === 0n || val === 0xFFFFFFFFFFFFFFFFn || val === -1n) return null;
   // 100-ns intervals → milliseconds: divide by 10000
   // Epoch offset: 11644473600000 ms between 1601-01-01 and 1970-01-01
-  const ms = Number(ft / 10000n) - 11644473600000;
+  const ms = Number(val / 10000n) - 11644473600000;
   return new Date(ms);
 }
 

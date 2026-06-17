@@ -79,27 +79,61 @@ export interface FileInfo {
 export class EverythingClient {
   private client: unknown | null = null;
   private _connected = false;
+  private _instanceName: string | null = null;
 
   /**
    * Connect to the local Everything service.
    * Everything must be running for this to succeed.
+   *
+   * If EVERYTHING_IPC_PIPE_NAME is set, that instance name is used directly.
+   * Otherwise auto-detects the correct named instance by trying common names
+   * (null/"", "1.5a", "1.5") and picking the first one with a loaded database.
    */
   connect(): void {
     if (this._connected) return;
 
-    this.client = ffi.Everything3_ConnectW(null);
+    // If user specified an instance name, use it directly — no probing.
+    const envInstance = process.env.EVERYTHING_IPC_PIPE_NAME;
+    if (envInstance !== undefined) {
+      this._connectOne(envInstance || null);
+      this._instanceName = envInstance || null;
+      return;
+    }
 
-    // Check for connection errors
+    // Auto-detect: try candidate instance names in order, keep first with DB loaded.
+    const candidates: (string | null)[] = [null, '1.5a', '1.5'];
+    for (const name of candidates) {
+      try {
+        this._connectOne(name);
+        if (this.client && ffi.Everything3_IsDBLoaded(this.client) && ffi.Everything3_GetMajorVersion(this.client) !== 0) {
+          this._instanceName = name;
+          return; // success — found the right instance
+        }
+        // Wrong instance — disconnect and try next
+        ffi.Everything3_DestroyClient(this.client!);
+        this.client = null;
+        this._connected = false;
+      } catch {
+        // try next candidate
+      }
+    }
+
+    // Fallback: keep the first candidate (null) connection so error messages are useful
+    try {
+      this._connectOne(null);
+      this._instanceName = null;
+    } catch {
+      throw new Error('Failed to connect to Everything. Is Everything running?');
+    }
+  }
+
+  /** Connect to a specific instance name. Internal — does not check _connected guard. */
+  private _connectOne(instanceName: string | null): void {
+    this.client = ffi.Everything3_ConnectW(instanceName ?? null);
+
     if (!this.client) {
       ffi.checkError();
       throw new Error('Failed to connect to Everything. Is Everything running?');
-    }
-
-    // Verify connection by checking last error
-    const err = ffi.Everything3_GetLastError();
-    if (err !== 0 && err !== 0xE0000000) {
-      // Some non-zero errors don't prevent connection
-      // Only treat IPC_PIPE_NOT_FOUND as fatal connection error
     }
 
     this._connected = true;
@@ -122,10 +156,36 @@ export class EverythingClient {
     return this._connected;
   }
 
+  /** The Everything instance name this client connected to (null = default unnamed instance). */
+  get instanceName(): string | null {
+    return this._instanceName;
+  }
+
   /** Check if the Everything database is loaded and ready. */
   isDBLoaded(): boolean {
     this.ensureConnected();
     return ffi.Everything3_IsDBLoaded(this.client!);
+  }
+
+  /**
+   * Wait for the Everything database to finish loading.
+   * Polls `isDBLoaded()` until it returns true or the timeout expires.
+   *
+   * @param timeoutMs Maximum time to wait in milliseconds (default: 10000).
+   * @param pollIntervalMs How often to check in milliseconds (default: 250).
+   * @returns true if the DB loaded within the timeout, false otherwise.
+   */
+  async waitForDBLoaded(timeoutMs = 10000, pollIntervalMs = 250): Promise<boolean> {
+    this.ensureConnected();
+
+    if (this.isDBLoaded()) return true;
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      if (this.isDBLoaded()) return true;
+    }
+    return false;
   }
 
   /** Get Everything version information. */
@@ -171,6 +231,20 @@ export class EverythingClient {
       ffi.Everything3_SetSearchMatchDiacritics(searchState, options.matchDiacritics ?? false);
       ffi.Everything3_SetSearchRegex(searchState, options.regex ?? false);
 
+      // Request all properties we plan to read from results.
+      // Without these, individual property getters return default/invalid values.
+      ffi.Everything3_ClearSearchPropertyRequests(searchState);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.NAME);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.PATH);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.SIZE);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.EXTENSION);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.TYPE);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.DATE_MODIFIED);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.DATE_CREATED);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.DATE_ACCESSED);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.ATTRIBUTES);
+      ffi.Everything3_AddSearchPropertyRequest(searchState, ffi.PROPERTY_ID.RUN_COUNT);
+
       // Pagination
       ffi.Everything3_SetSearchViewportOffset(searchState, offset);
       ffi.Everything3_SetSearchViewportCount(searchState, maxResults);
@@ -194,22 +268,30 @@ export class EverythingClient {
 
         for (let i = 0; i < count; i++) {
           try {
+            const name = ffi.Everything3_GetResultNameW(resultList, i);
+            const path = ffi.Everything3_GetResultPathW(resultList, i);
+            const attrs = ffi.Everything3_GetResultAttributes(resultList, i);
             const dateModified = ffi.filetimeToDate(ffi.Everything3_GetResultDateModified(resultList, i));
             const dateCreated = ffi.filetimeToDate(ffi.Everything3_GetResultDateCreated(resultList, i));
             const dateAccessed = ffi.filetimeToDate(ffi.Everything3_GetResultDateAccessed(resultList, i));
 
+            // Build full path from path + name (more reliable than the convenience
+            // function when property requests are active).
+            const fullPath = path && name ? `${path}\\${name}` : ffi.Everything3_GetResultFullPathNameW(resultList, i);
+
             results.push({
-              fullPath: ffi.Everything3_GetResultFullPathNameW(resultList, i),
-              name: ffi.Everything3_GetResultNameW(resultList, i),
-              path: ffi.Everything3_GetResultPathW(resultList, i),
+              fullPath,
+              name,
+              path,
               extension: ffi.Everything3_GetResultExtensionW(resultList, i),
               type: ffi.Everything3_GetResultTypeW(resultList, i),
               size: ffi.Everything3_GetResultSize(resultList, i),
-              isFolder: ffi.Everything3_IsFolderResult(resultList, i),
+              // Use FILE_ATTRIBUTE_DIRECTORY (0x10) — more reliable than IsFolderResult
+              isFolder: (attrs & 0x10) !== 0,
               dateModified,
               dateCreated,
               dateAccessed,
-              attributes: ffi.Everything3_GetResultAttributes(resultList, i),
+              attributes: attrs,
               runCount: ffi.Everything3_GetResultRunCount(resultList, i),
             });
           } catch {

@@ -19,6 +19,7 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { EverythingClient } from './everything-client.js';
+import { getArchInfo } from './ffi-bindings.js';
 
 // ─── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -158,6 +159,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           everything.connect();
         }
 
+        // Ensure the database is loaded before searching
+        if (!everything.isDBLoaded()) {
+          const ready = await everything.waitForDBLoaded(5000, 500);
+          if (!ready) {
+            return {
+              content: [{ type: 'text', text: 'Everything database is not yet loaded. Please wait for Everything to finish indexing and try again.' }],
+              isError: true,
+            };
+          }
+        }
+
         const results = everything.search({
           query,
           maxResults: (args?.maxResults as number) ?? 50,
@@ -207,6 +219,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'everything_status': {
+        const archInfo = getArchInfo();
         let connected = false;
         let dbLoaded = false;
 
@@ -215,7 +228,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             everything.connect();
           }
           connected = true;
-          dbLoaded = everything.isDBLoaded();
+
+          // Wait briefly for the DB to load (Everything may still be indexing)
+          dbLoaded = await everything.waitForDBLoaded(5000, 500);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return {
@@ -223,13 +238,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const lines = [
+          `Everything Status:`,
+          `- Connected: ${connected ? 'Yes ✓' : 'No ✗'}`,
+          `- Database Loaded: ${dbLoaded ? 'Yes ✓' : 'No ✗ (may still be indexing)'}`,
+          `- Instance: ${everything.instanceName ?? '(default unnamed)'}`,
+          `- Detected Arch: ${archInfo.arch}`,
+          `- DLL: ${archInfo.dll}`,
+        ];
+
         return {
-          content: [
-            {
-              type: 'text',
-              text: `Everything Status:\n- Connected: ${connected ? 'Yes ✓' : 'No ✗'}\n- Database Loaded: ${dbLoaded ? 'Yes ✓' : 'No ✗'}`,
-            },
-          ],
+          content: [{ type: 'text', text: lines.join('\n') }],
         };
       }
 
