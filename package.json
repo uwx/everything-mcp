@@ -1,5 +1,5 @@
 {
-  "name": "everything-mcp",
+  "name": "everythingsdk-mcp",
   "version": "1.0.0",
   "description": "MCP server for Everything search using ffi-rs and the Everything SDK",
   "type": "module",
